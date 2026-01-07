@@ -1,168 +1,113 @@
-# Ki2API - Claude Sonnet 4 OpenAI兼容API
+# Ki2API - OpenAI兼容API (增强版)
 
-一个简单易用的Docker化OpenAI兼容API服务，专门用于Claude Sonnet 4.5模型。
+> 🙏 **致谢**: 本项目基于 [zhalice2011/ki2api](https://github.com/zhalice2011/ki2api) 进行开发和增强，感谢原作者的贡献！
 
-## 功能特点
+一个将 Kiro/AWS CodeWhisperer 的 Claude 模型转换为 OpenAI 兼容 API 的服务，支持 Cursor、ChatBox 等工具使用。
 
-- 🐳 **Docker傻瓜式运行** - 一行命令启动服务
-- 🔑 **固定API密钥** - 使用 `ki2api-key-2024`
-- 🎯 **单一模型** - 仅支持 `claude-sonnet-4-5-20250929`
-- 🌐 **OpenAI兼容** - 完全兼容OpenAI API格式
-- 📡 **流式传输** - 支持SSE流式响应
-- 🔄 **自动token刷新** - 支持token过期自动刷新
+## ✨ 增强功能
+
+相比原版，本 Fork 增加了以下功能：
+
+- � ***多模型支持** - 支持 Claude Opus 4.5、Sonnet 4.5 等多种模型
+- �️ **工具o调用支持** - 完整支持 Function Calling / Tool Use
+- 🔄 **双格式兼容** - 同时支持 OpenAI 和 Anthropic 格式的工具调用
+- 🖼️ **图片支持** - 支持多模态图片输入
+- 🎯 **Cursor 适配** - 专门优化了与 Cursor IDE 的兼容性
+- 📝 **调试功能** - 可保存请求到文件便于调试
+
+## 支持的模型
+
+| 模型别名 | 实际模型 |
+|---------|---------|
+| `claude-sonnet-4-5-20250929` | Claude Sonnet 4.5 |
+| `claude-opus-4-5-20251101` | Claude Opus 4.5 |
+| `claude-4.5-opus-high-thinking` | Claude Opus 4.5 (Cursor) |
+| `claude-4-sonnet` | Claude Sonnet 4.5 (Cursor) |
+| `gpt-4` / `gpt-4o` | 映射到 Claude Sonnet 4.5 |
 
 ## 快速开始
 
-### 零配置启动（推荐）
+### 1. 确保已登录 Kiro
 
-只需确保已登录Kiro，然后一键启动：
+Token 文件位置：
+- **Windows**: `%USERPROFILE%\.aws\sso\cache\kiro-auth-token.json`
+- **macOS/Linux**: `~/.aws/sso/cache/kiro-auth-token.json`
 
+### 2. 读取 Token
+
+```bash
+python token_reader.py
+```
+
+### 3. 启动服务
+
+**方式一：直接运行**
+```bash
+pip install -r requirements.txt
+python app.py
+```
+
+**方式二：Docker**
 ```bash
 docker-compose up -d
 ```
 
 服务将在 http://localhost:8989 启动
 
-### 自动读取token
+### 4. 配置 Cursor
 
-容器会自动读取你本地的token文件：
-- **macOS/Linux**: `~/.aws/sso/cache/kiro-auth-token.json`
-- **Windows**: `%USERPROFILE%\.aws\sso\cache\kiro-auth-token.json`
+由于 Cursor 会阻止 localhost 连接，需要使用 ngrok：
 
-### 3. 测试API
-
-#### 获取模型列表
 ```bash
-curl -H "Authorization: Bearer ki2api-key-2024" \
-     http://localhost:8989/v1/models
+ngrok http 8989
 ```
 
-#### 非流式对话
+然后在 Cursor 设置中：
+- **API Key**: `ki2api-key-2024`
+- **Base URL**: `https://xxx.ngrok-free.dev/v1`
+
+## API 端点
+
+| 端点 | 方法 | 说明 |
+|-----|------|-----|
+| `/v1/models` | GET | 获取模型列表 |
+| `/v1/chat/completions` | POST | 聊天补全 |
+| `/health` | GET | 健康检查 |
+
+## 测试
+
 ```bash
 curl -X POST http://localhost:8989/v1/chat/completions \
   -H "Authorization: Bearer ki2api-key-2024" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-sonnet-4-5-20250929",
-    "messages": [
-      {"role": "user", "content": "你好，请介绍一下自己"}
-    ],
+    "messages": [{"role": "user", "content": "你好"}],
     "max_tokens": 1000
   }'
 ```
-
-#### 流式对话
-```bash
-curl -X POST http://localhost:8989/v1/chat/completions \
-  -H "Authorization: Bearer ki2api-key-2024" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-sonnet-4-5-20250929",
-    "messages": [
-      {"role": "user", "content": "写一首关于春天的诗"}
-    ],
-    "stream": true,
-    "max_tokens": 500
-  }'
-```
-
-## Docker使用方法
-
-### 使用Docker Compose（推荐）
-```bash
-# 启动服务
-docker-compose up -d
-
-# 查看日志
-docker-compose logs -f
-
-# 停止服务
-docker-compose down
-```
-
-### 使用Docker命令
-```bash
-# 构建镜像
-docker build -t ki2api .
-
-# 运行容器
-docker run -d \
-  -p 8989:8989 \
-  -e KIRO_ACCESS_TOKEN=your_token \
-  -e KIRO_REFRESH_TOKEN=your_refresh_token \
-  --name ki2api \
-  ki2api
-```
-
-## API端点
-
-### GET /v1/models
-获取可用模型列表
-
-### POST /v1/chat/completions
-创建聊天完成
-
-### GET /health
-健康检查端点
 
 ## 环境变量
 
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
-| API_KEY | ki2api-key-2024 | API访问密钥 |
-| KIRO_ACCESS_TOKEN | - | Kiro访问令牌（必需） |
-| KIRO_REFRESH_TOKEN | - | Kiro刷新令牌（必需） |
+| `API_KEY` | `ki2api-key-2024` | API 访问密钥 |
+| `KIRO_ACCESS_TOKEN` | - | Kiro 访问令牌 |
+| `KIRO_REFRESH_TOKEN` | - | Kiro 刷新令牌 |
 
-## 开发模式
+## ⚠️ 免责声明
 
-### 本地运行
-```bash
-# 安装依赖
-pip install -r requirements.txt
-
-# 设置环境变量
-export KIRO_ACCESS_TOKEN=your_token
-export KIRO_REFRESH_TOKEN=your_refresh_token
-
-# 启动服务
-python app.py
-```
-
-## 故障排除
-
-### 常见问题
-
-1. **Token过期**
-   - 确保refresh token有效
-   - 重新获取最新的token
-
-2. **连接失败**
-   - 检查端口8989是否被占用
-   - 确认Docker容器正常运行
-
-3. **API返回401**
-   - 确认使用了正确的API密钥：`ki2api-key-2024`
-   - 检查token是否有效
-
-### 查看日志
-```bash
-# Docker日志
-docker-compose logs -f ki2api
-
-# 本地日志
-python app.py 2>&1 | tee ki2api.log
-```
-
-## 项目结构
-```
-ki2api/
-├── app.py              # 主应用文件
-├── Dockerfile          # Docker镜像定义
-├── docker-compose.yml  # Docker Compose配置
-├── requirements.txt    # Python依赖
-└── README.md          # 本文档
-```
+- 本项目仅供**学习和研究**使用
+- 使用本项目时请遵守 [AWS 服务条款](https://aws.amazon.com/service-terms/) 和 [Anthropic 使用政策](https://www.anthropic.com/policies)
+- 本项目通过 Kiro 的认证机制访问 AWS CodeWhisperer，请确保你有合法的使用权限
+- **请勿**将本项目用于任何商业用途或违反服务条款的行为
+- 作者不对任何滥用行为或由此产生的后果负责
+- 使用本项目即表示你已理解并同意以上条款
 
 ## 许可证
 
 MIT License
+
+## 致谢
+
+- 原项目: [zhalice2011/ki2api](https://github.com/zhalice2011/ki2api)

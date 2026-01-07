@@ -1,2 +1,35 @@
+# 环境变量和敏感信息
+.env
+*.env
+!.env.example
+
+# 调试文件
+debug_requests/
 test/
 docker.log
+
+# HuggingFace 部署文件（如不需要）
+huggingface/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 日志
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db

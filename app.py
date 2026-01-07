@@ -18,8 +18,8 @@ from dotenv import load_dotenv
 from json_repair import repair_json
 
 # Configure logging
-# logging.basicConfig(level=logging.INFO) # for dev
-logging.basicConfig(level=logging.WARNING) 
+logging.basicConfig(level=logging.INFO) # for dev
+# logging.basicConfig(level=logging.WARNING) 
 logger = logging.getLogger(__name__)
 
 # Load environment variables
@@ -32,6 +32,48 @@ app = FastAPI(
     version="3.0.1"
 )
 
+# Debug middleware to log raw requests
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    if request.url.path == "/v1/chat/completions":
+        body = await request.body()
+        body_str = body.decode('utf-8', errors='ignore')
+        # Save request to file for debugging
+        import json
+        from datetime import datetime
+        try:
+            data = json.loads(body_str)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            filename = f"debug_requests/request_{timestamp}.json"
+            os.makedirs("debug_requests", exist_ok=True)
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            logger.info(f"📁 Saved request to {filename}")
+            
+            # Log summary
+            messages = data.get("messages", [])
+            logger.info(f"🔍 REQUEST MESSAGES COUNT: {len(messages)}")
+            for i, msg in enumerate(messages):
+                role = msg.get("role", "unknown")
+                tool_call_id = msg.get("tool_call_id", "")
+                tool_calls = msg.get("tool_calls", [])
+                content = msg.get("content", "")
+                content_preview = ""
+                if isinstance(content, str):
+                    content_preview = content[:100] if content else "None"
+                elif isinstance(content, list):
+                    content_preview = f"[{len(content)} parts]"
+                logger.info(f"🔍 MSG[{i}] role={role}, tool_call_id={tool_call_id}, tool_calls={len(tool_calls) if tool_calls else 0}, content={content_preview}...")
+        except Exception as e:
+            logger.error(f"Failed to save request: {e}")
+        # Reconstruct request with body
+        from starlette.requests import Request as StarletteRequest
+        async def receive():
+            return {"type": "http.request", "body": body}
+        request = StarletteRequest(request.scope, receive)
+    response = await call_next(request)
+    return response
+
 # Configuration
 API_KEY = os.getenv("API_KEY", "ki2api-key-2024")
 KIRO_ACCESS_TOKEN = os.getenv("KIRO_ACCESS_TOKEN")
@@ -42,7 +84,21 @@ PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK
 # Model mapping
 MODEL_MAP = {
     "claude-sonnet-4-5-20250929": "CLAUDE_SONNET_4_5_20250929_V1_0",
+    "claude-opus-4-5-20251101": "CLAUDE_OPUS_4_5_20251101_V1_0",
     "claude-3-5-haiku-20241022":  "auto",
+    # OpenAI model aliases -> map to Claude
+    "gpt-4": "CLAUDE_SONNET_4_5_20250929_V1_0",
+    "gpt-4o": "CLAUDE_SONNET_4_5_20250929_V1_0",
+    "gpt-4-turbo": "CLAUDE_SONNET_4_5_20250929_V1_0",
+    "gpt-3.5-turbo": "CLAUDE_SONNET_4_5_20250929_V1_0",
+    # Cursor model aliases
+    "claude-4.5-opus-high-thinking": "CLAUDE_OPUS_4_5_20251101_V1_0",
+    "claude-4-opus-high-thinking": "CLAUDE_OPUS_4_5_20251101_V1_0",
+    "claude-4.5-sonnet": "CLAUDE_SONNET_4_5_20250929_V1_0",
+    "claude-4-sonnet": "CLAUDE_SONNET_4_5_20250929_V1_0",
+    "claude-3.5-sonnet": "CLAUDE_SONNET_4_5_20250929_V1_0",
+    "claude-3-5-sonnet": "CLAUDE_SONNET_4_5_20250929_V1_0",
+    "gpt-4o-mini": "CLAUDE_SONNET_4_5_20250929_V1_0",
 }
 DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
 
@@ -60,11 +116,59 @@ class ToolCall(BaseModel):
     id: str
     type: str = "function"
     function: Dict[str, Any]
+
 class ChatMessage(BaseModel):
     role: str
-    content: Union[str, List[ContentPart], None]
+    content: Union[str, List[Any], None]  # Changed to List[Any] to handle various content types
     tool_calls: Optional[List[ToolCall]] = None
     tool_call_id: Optional[str] = None  # 用于 tool 角色的消息
+    
+    class Config:
+        extra = "ignore"  # Ignore extra fields like 'name' in tool_use
+    
+    def get_tool_calls_from_content(self) -> List[ToolCall]:
+        """Extract tool calls from Anthropic-style content (tool_use blocks)"""
+        tool_calls = []
+        if isinstance(self.content, list):
+            for part in self.content:
+                if isinstance(part, dict) and part.get("type") == "tool_use":
+                    # Convert Anthropic tool_use to OpenAI tool_call format
+                    tool_call = ToolCall(
+                        id=part.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                        type="function",
+                        function={
+                            "name": part.get("name", "unknown"),
+                            "arguments": json.dumps(part.get("input", {}), ensure_ascii=False)
+                        }
+                    )
+                    tool_calls.append(tool_call)
+                    logger.info(f"📌 Extracted tool_use from content: {part.get('name')}")
+        return tool_calls
+    
+    def get_tool_results_from_content(self) -> List[Dict[str, Any]]:
+        """Extract tool results from Anthropic-style content (tool_result blocks)"""
+        tool_results = []
+        if isinstance(self.content, list):
+            for part in self.content:
+                if isinstance(part, dict) and part.get("type") == "tool_result":
+                    # Extract the text content from tool_result
+                    result_content = ""
+                    content_data = part.get("content", [])
+                    if isinstance(content_data, str):
+                        result_content = content_data
+                    elif isinstance(content_data, list):
+                        for item in content_data:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                result_content += item.get("text", "")
+                            elif isinstance(item, str):
+                                result_content += item
+                    
+                    tool_results.append({
+                        "tool_use_id": part.get("tool_use_id", "unknown"),
+                        "content": result_content
+                    })
+                    logger.info(f"📌 Extracted tool_result: id={part.get('tool_use_id')}, content_length={len(result_content)}")
+        return tool_results
     
     def get_content_text(self) -> str:
         """Extract text content from either string or content parts"""
@@ -81,8 +185,15 @@ class ChatMessage(BaseModel):
                 if isinstance(part, dict):
                     if part.get("type") == "text" and "text" in part:
                         text_parts.append(part.get("text", ""))
-                    elif part.get("type") == "tool_result" and "content" in part:
-                        text_parts.append(part.get("content", ""))
+                    elif part.get("type") == "tool_result":
+                        # Extract text from tool_result content
+                        content_data = part.get("content", [])
+                        if isinstance(content_data, str):
+                            text_parts.append(content_data)
+                        elif isinstance(content_data, list):
+                            for item in content_data:
+                                if isinstance(item, dict) and item.get("type") == "text":
+                                    text_parts.append(item.get("text", ""))
                 elif hasattr(part, 'text') and part.text:
                     text_parts.append(part.text)
             return "".join(text_parts)
@@ -97,7 +208,14 @@ class Function(BaseModel):
 
 class Tool(BaseModel):
     type: str = "function"
-    function: Function
+    function: Optional[Function] = None
+    # Support Cursor/Anthropic format (name, description, input_schema at top level)
+    name: Optional[str] = None
+    description: Optional[str] = None
+    input_schema: Optional[Dict[str, Any]] = None
+    
+    class Config:
+        extra = "ignore"
 
 
 
@@ -114,6 +232,12 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = None
     tools: Optional[List[Tool]] = None
     tool_choice: Optional[Union[str, Dict[str, Any]]] = "auto"
+    # Extra fields for compatibility with various clients (Cursor, etc.)
+    metadata: Optional[Dict[str, Any]] = None
+    stream_options: Optional[Dict[str, Any]] = None
+    
+    class Config:
+        extra = "ignore"  # Ignore any extra fields not defined here
 
 class Usage(BaseModel):
     prompt_tokens: int
@@ -638,7 +762,9 @@ def build_codewhisperer_request(request: ChatCompletionRequest):
     system_prompt = ""
     conversation_messages = []
     
-    for msg in request.messages:
+    logger.info(f"🔍 BUILD REQUEST: Processing {len(request.messages)} messages")
+    for i, msg in enumerate(request.messages):
+        logger.info(f"🔍 BUILD REQUEST: Message {i}: role={msg.role}, tool_call_id={getattr(msg, 'tool_call_id', None)}, has_tool_calls={bool(getattr(msg, 'tool_calls', None))}")
         if msg.role == "system":
             system_prompt = msg.get_content_text()
         elif msg.role in ["user", "assistant", "tool"]:
@@ -671,20 +797,54 @@ def build_codewhisperer_request(request: ChatCompletionRequest):
             msg = history_messages[i]
             
             if msg.role == "user":
-                content = msg.get_content_text() or "Continue"
+                # Check if this user message contains tool results (Anthropic format)
+                tool_results = msg.get_tool_results_from_content()
+                if tool_results:
+                    # Format tool results
+                    result_parts = []
+                    for tr in tool_results:
+                        result_parts.append(f"<tool_result tool_call_id=\"{tr['tool_use_id']}\">\n{tr['content']}\n</tool_result>")
+                    
+                    # Also get any text content
+                    text_content = ""
+                    if isinstance(msg.content, list):
+                        for part in msg.content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                text_content += part.get("text", "")
+                    
+                    combined_results = "\n\n".join(result_parts)
+                    if text_content:
+                        content = f"Here are the results of the tool calls:\n\n{combined_results}\n\n{text_content}"
+                    else:
+                        content = f"Here are the results of the tool calls:\n\n{combined_results}\n\nPlease continue based on these results."
+                    
+                    logger.info(f"📌 Processing user message with {len(tool_results)} tool results")
+                else:
+                    content = msg.get_content_text() or "Continue"
                 processed_messages.append(("user", content))
                 i += 1
             elif msg.role == "assistant":
-                # Check if this assistant message contains tool calls
+                # Check for tool calls - both OpenAI format (tool_calls field) and Anthropic format (tool_use in content)
+                tool_calls = []
+                
+                # OpenAI format
                 if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    tool_calls = msg.tool_calls
+                
+                # Anthropic format (tool_use in content)
+                anthropic_tool_calls = msg.get_tool_calls_from_content()
+                if anthropic_tool_calls:
+                    tool_calls.extend(anthropic_tool_calls)
+                
+                if tool_calls:
                     # Build a description of the tool calls
                     tool_descriptions = []
-                    for tc in msg.tool_calls:
+                    for tc in tool_calls:
                         func_name = tc.function.get("name", "unknown") if isinstance(tc.function, dict) else "unknown"
                         args = tc.function.get("arguments", "{}") if isinstance(tc.function, dict) else "{}"
                         tool_descriptions.append(f"[Called {func_name} with args: {args}]")
                     content = " ".join(tool_descriptions)
-                    logger.info(f"📌 Processing assistant message with tool calls: {content}")
+                    logger.info(f"📌 Processing assistant message with {len(tool_calls)} tool calls: {content[:200]}...")
                 else:
                     content = msg.get_content_text() or "I understand."
                 processed_messages.append(("assistant", content))
@@ -694,19 +854,36 @@ def build_codewhisperer_request(request: ChatCompletionRequest):
                 tool_content = msg.get_content_text() or "[Tool executed]"
                 tool_call_id = getattr(msg, 'tool_call_id', 'unknown')
                 
-                # Format tool result with ID for tracking
-                formatted_tool_result = f"[Tool result for {tool_call_id}]: {tool_content}"
+                # Format tool result clearly so the model can see the file contents
+                # Use a more explicit format that the model will understand
+                formatted_tool_result = f"<tool_result tool_call_id=\"{tool_call_id}\">\n{tool_content}\n</tool_result>"
                 
-                # Look ahead to see if there's a user message
-                if i + 1 < len(history_messages) and history_messages[i + 1].role == "user":
-                    user_content = history_messages[i + 1].get_content_text() or ""
-                    combined_content = f"{formatted_tool_result}\n{user_content}".strip()
+                logger.info(f"📌 Processing tool result: tool_call_id={tool_call_id}, content_length={len(tool_content)}")
+                
+                # Collect all consecutive tool results
+                tool_results = [formatted_tool_result]
+                j = i + 1
+                while j < len(history_messages) and history_messages[j].role == "tool":
+                    next_tool = history_messages[j]
+                    next_content = next_tool.get_content_text() or "[Tool executed]"
+                    next_id = getattr(next_tool, 'tool_call_id', 'unknown')
+                    tool_results.append(f"<tool_result tool_call_id=\"{next_id}\">\n{next_content}\n</tool_result>")
+                    logger.info(f"📌 Adding consecutive tool result: tool_call_id={next_id}")
+                    j += 1
+                
+                combined_tool_results = "\n\n".join(tool_results)
+                
+                # Look ahead to see if there's a user message after all tool results
+                if j < len(history_messages) and history_messages[j].role == "user":
+                    user_content = history_messages[j].get_content_text() or ""
+                    combined_content = f"Here are the results of the tool calls:\n\n{combined_tool_results}\n\nUser message: {user_content}".strip()
                     processed_messages.append(("user", combined_content))
-                    i += 2
+                    i = j + 1
                 else:
-                    # Tool result without following user message - add as user message
-                    processed_messages.append(("user", formatted_tool_result))
-                    i += 1
+                    # Tool results without following user message - add as user message
+                    combined_content = f"Here are the results of the tool calls:\n\n{combined_tool_results}\n\nPlease continue based on these results."
+                    processed_messages.append(("user", combined_content))
+                    i = j
             else:
                 i += 1
         
@@ -766,19 +943,32 @@ def build_codewhisperer_request(request: ChatCompletionRequest):
     images = []
     if isinstance(current_message.content, list):
         for part in current_message.content:
-            if part.type == "image_url" and part.image_url:
+            # Handle both dict and object formats
+            part_type = part.get("type") if isinstance(part, dict) else getattr(part, 'type', None)
+            
+            if part_type == "image_url":
                 try:
+                    # Get image_url data
+                    if isinstance(part, dict):
+                        image_url_data = part.get("image_url", {})
+                        url = image_url_data.get("url", "") if isinstance(image_url_data, dict) else ""
+                    else:
+                        url = part.image_url.url if part.image_url else ""
+                    
+                    if not url:
+                        continue
+                        
                     # 记录原始 URL 的前 50 个字符，用于调试
-                    logger.info(f"🔍 处理图片 URL: {part.image_url.url[:50]}...")
+                    logger.info(f"🔍 处理图片 URL: {url[:50]}...")
                     
                     # 检查 URL 格式是否正确
-                    if not part.image_url.url.startswith("data:image/"):
+                    if not url.startswith("data:image/"):
                         logger.error(f"❌ 图片 URL 格式不正确，应该以 'data:image/' 开头")
                         continue
                     
                     # Correctly parse the data URI
                     # format: data:image/jpeg;base64,{base64_string}
-                    header, encoded_data = part.image_url.url.split(",", 1)
+                    header, encoded_data = url.split(",", 1)
                     
                     # Correctly parse the image format from the mime type
                     # "data:image/jpeg;base64" -> "jpeg"
@@ -807,11 +997,39 @@ def build_codewhisperer_request(request: ChatCompletionRequest):
     current_content = current_message.get_content_text()
     
     # Handle different roles for current message
-    if current_message.role == "tool":
-        # For tool results, format them properly and mark as completed
+    if current_message.role == "user":
+        # Check if this user message contains tool results (Anthropic format)
+        tool_results = current_message.get_tool_results_from_content()
+        if tool_results:
+            # Format tool results
+            result_parts = []
+            for tr in tool_results:
+                result_parts.append(f"<tool_result tool_call_id=\"{tr['tool_use_id']}\">\n{tr['content']}\n</tool_result>")
+            
+            combined_results = "\n\n".join(result_parts)
+            
+            # Also get any text content
+            text_content = ""
+            if isinstance(current_message.content, list):
+                for part in current_message.content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_content += part.get("text", "")
+            
+            if text_content:
+                current_content = f"Here are the results of the tool calls:\n\n{combined_results}\n\n{text_content}"
+            else:
+                current_content = f"Here are the results of the tool calls:\n\n{combined_results}\n\nPlease continue based on these results."
+            
+            logger.info(f"📌 Current message contains {len(tool_results)} tool results")
+    elif current_message.role == "tool":
+        # For tool results, format them properly so the model can see the content
         tool_result = current_content or '[Tool executed]'
         tool_call_id = getattr(current_message, 'tool_call_id', 'unknown')
-        current_content = f"[Tool execution completed for {tool_call_id}]: {tool_result}"
+        
+        # Use XML format for clarity
+        current_content = f"Here is the result of the tool call:\n\n<tool_result tool_call_id=\"{tool_call_id}\">\n{tool_result}\n</tool_result>\n\nPlease continue based on this result."
+        
+        logger.info(f"📌 Current message is tool result: tool_call_id={tool_call_id}, content_length={len(tool_result)}")
         
         # Check if this tool result follows a tool call in history
         if len(conversation_messages) > 1:
@@ -821,7 +1039,7 @@ def build_codewhisperer_request(request: ChatCompletionRequest):
                 for tc in prev_message.tool_calls:
                     if tc.id == tool_call_id:
                         func_name = tc.function.get("name", "unknown") if isinstance(tc.function, dict) else "unknown"
-                        current_content = f"[Completed execution of {func_name}]: {tool_result}"
+                        current_content = f"Here is the result of calling {func_name}:\n\n<tool_result tool_call_id=\"{tool_call_id}\">\n{tool_result}\n</tool_result>\n\nPlease continue based on this result."
                         break
     elif current_message.role == "assistant":
         # If last message is from assistant with tool calls, format it appropriately
@@ -862,15 +1080,27 @@ def build_codewhisperer_request(request: ChatCompletionRequest):
     # Add context for tools
     user_input_message_context = {}
     if request.tools:
-        user_input_message_context["tools"] = [
-            {
+        tools_list = []
+        for tool in request.tools:
+            # Support both OpenAI format (function wrapper) and Cursor format (top-level)
+            if tool.function:
+                tool_name = tool.function.name
+                tool_desc = tool.function.description or ""
+                tool_params = tool.function.parameters or {}
+            else:
+                # Cursor format: name, description, input_schema at top level
+                tool_name = tool.name or "unknown"
+                tool_desc = tool.description or ""
+                tool_params = tool.input_schema or {}
+            
+            tools_list.append({
                 "toolSpecification": {
-                    "name": tool.function.name,
-                    "description": tool.function.description or "",
-                    "inputSchema": {"json": tool.function.parameters or {}}
+                    "name": tool_name,
+                    "description": tool_desc,
+                    "inputSchema": {"json": tool_params}
                 }
-            } for tool in request.tools
-        ]
+            })
+        user_input_message_context["tools"] = tools_list
     
     # 根据文档，images 应该是 userInputMessage 的直接子字段，而不是在 userInputMessageContext 中
     if images:
